@@ -136,7 +136,7 @@ try:
     idfgoogleamazon = idfs(googleToken.union(amazonToken))
     outPutPrint("google and amazon all together has words of :" , idfgoogleamazon.count())
     print idfgoogleamazon.take(10)
-    
+    idfsWeight = idfgoogleamazon.collectAsMap()
     #draw idf
     seaborn.distplot(idfgoogleamazon.map(lambda (x,y) : y).collect())
     
@@ -152,7 +152,72 @@ try:
             tfIdfDict[t] = tfs[t] * idf[t]
         return tfIdfDict
     
+    #tf is a dict ; idf is a RDD ; func tokenize return a list of word
+    import math
+    def dotprod(a,b):
+        '''
+        a,b is a dict
+        calac dot product
+        '''
+        sumResult = 0
+        for key in set(a.keys()).intersection(set(b.keys())):
+          sumResult += a[key] * b[key]
+        return sumResult
+    def norm(a):
+        '''
+        square root of dot product
+        '''
+        return math.sqrt(dotprod(a,a))
     
+    def cossim(a,b):
+        '''
+        a,b is a dict
+        calc cos similarity
+        '''
+        return dotprod(a,b) / (norm(a)*norm(b))
+    
+    def cosineSimilarity(string1 , string2 , idfsDictionary):
+        w1 = tfidf(tf(tokenize(string1)) , idfsDictionary)
+        w2 = tfidf(tf(tokenize(string2)) , idfsDictionary)
+        return cossim(w1, w2)
+    
+    #create descarte
+    crossRDD = googleToken.cartesian(amazonToken).cache()
+    
+    def computeSimilarity(record):
+        '''
+        define a worker func
+        '''
+        googleRec = record[0]
+        amazonRec = record[1]
+        googleUrl = googleRec[0]
+        amazonID = amazonRec[0]
+        googleValue = googleRec[1]
+        amazonValue = amazonRec[1]
+        cs = cosineSimilarity(googleValue , amazonValue , idfsWeight)
+        return (googleUrl , amazonID , cs)
+    
+    def computeSimilarityBroadcast(record):
+        '''
+        define a worker func
+        '''
+        googleRec = record[0]
+        amazonRec = record[1]
+        googleUrl = googleRec[0]
+        amazonID = amazonRec[0]
+        googleValue = googleRec[1]
+        amazonValue = amazonRec[1]
+        cs = cosineSimilarity(googleValue , amazonValue , idfsWeightBroadcast.value)
+        return (googleUrl , amazonID , cs)
+    
+    idfsWeightBroadcast = sc.broadcast(idfsWeight)
+    
+    #evaluation
+    goldStandard = sqc.read.csv('./data/mapping.csv' , header = True).rdd.map(lambda (x,y) : ('%s %s'% (x , y) , 'gold'))
+    outPutPrint("goldStandard sample : " , goldStandard.take(2))
+    
+    amazonFullRecToToken = amazon.map(lambda (x,y):(x,tokenize(y)))
+    googleFullRecToToken = google.map(lambda (x,y):(x,tokenize(y)))
     
     
 except Exception as e:
