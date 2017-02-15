@@ -10,6 +10,8 @@ from pyspark import SparkContext
 from pyspark.sql import SQLContext
 import traceback
 import datetime
+import re
+import seaborn
 
 sc = SparkContext("local[4]" , "cs110 week3 lab2 APP")
 sc.setLogLevel("ERROR")
@@ -63,7 +65,96 @@ def clear_env():
 
 
 try:
-    pass
+    #loadData
+    google = (sqc.read
+              .csv('./data/targets.csv' , header = True)
+              .rdd
+              .map(lambda x : (x.asDict()['id'],'%s %s %s' % (x.asDict()['title'] , x.asDict()['description'] ,x.asDict()['manufacturer'])))
+              )
+    print google.take(2)
+    google.cache()
+    googleSmall = sc.parallelize(google.takeSample(False , 200 , 11))
+    outPutPrint("google has items of ", google.count())
+    
+    amazon = (sqc.read
+              .csv('./data/targets.csv' , header = True)
+              .rdd
+              .map(lambda x : (x.asDict()['id'],'%s %s %s' % (x.asDict()['title'] , x.asDict()['description'] ,x.asDict()['manufacturer'])))
+              )
+    print amazon.take(2)
+    amazon.cache()
+    print amazon.count()
+    amazonSmall = sc.parallelize(amazon.takeSample(False , 200 , 11))
+    
+    split_regex = r'\W+'
+    def simpleTokenize(string):
+        if string == '':
+            return []
+        return re.split(split_regex,re.sub(split_regex , ' ' , string).strip().lower())
+    
+    def getStopWords(string):
+        return re.split(r"u'(\W+)'" , string)
+    
+    stopwords = set(sc.textFile('./data/stopwords.txt').flatMap(getStopWords).collect())
+    #print stopwords
+    
+    def tokenize(string):
+        return [w for w in simpleTokenize(string) if w not in stopwords]
+    
+    #('b00004tkvy', ['noah', 'ark', 'activity', 'center', 'jewel', 'case', 'ages', '3', '8', 'victory', 'multimedia'])
+    amazonRecToToken = amazonSmall.map(lambda (x,y):(x,tokenize(y)))
+    googleRecToToken = googleSmall.map(lambda (x,y):(x,tokenize(y)))
+    amazonToken = amazon.map(lambda (x,y):(x , tokenize(y)))
+    googleToken = google.map(lambda (x,y):(x,tokenize(y)))
+    def countTokens(venderRDD):
+        return venderRDD.map(lambda (x,y):len(y)).reduce(lambda x,y:x+y)
+    
+    def findBiggestRecord(venderRDD):
+        return venderRDD.sortBy(lambda (x,y):len(y)*-1)
+    
+    #TF-IDF
+    def tf(tokens):
+        tfResult = {}
+        for t in tokens:
+            tfResult.setdefault(t,0)
+            tfResult[t] += 1
+        tokens_num = len(tokens)
+        for token in tfResult:
+            tfResult[token] = tfResult[token]*1.0/tokens_num
+                    
+        return tfResult
+    
+    corpusRDD = amazonRecToToken.union(googleRecToToken)
+    
+    def idfs(corpus):
+        uniqueTokens = corpus.map(lambda (x,y):list(set(y)))
+        tokenCountPairTuple = uniqueTokens.flatMap(lambda x : x)
+        tokenSumPairTuple = tokenCountPairTuple.map(lambda x:(x,1)).reduceByKey(lambda x,y :x+y)
+        N = corpus.count()
+        return (tokenSumPairTuple.map(lambda (x , y) :(x , N*1.0/y)))
+    
+    idfgoogleamazon = idfs(googleToken.union(amazonToken))
+    outPutPrint("google and amazon all together has words of :" , idfgoogleamazon.count())
+    print idfgoogleamazon.take(10)
+    
+    #draw idf
+    seaborn.distplot(idfgoogleamazon.map(lambda (x,y) : y).collect())
+    
+    #tfidf
+    def tfidf(tokens ,idf):
+        '''
+        tokens are word list
+        idf is a dict
+        '''
+        tfs = tf(tokens)
+        tfIdfDict = {}
+        for t in tfs:
+            tfIdfDict[t] = tfs[t] * idf[t]
+        return tfIdfDict
+    
+    
+    
+    
 except Exception as e:
     outPutPrint("[ERROR]",e)
     traceback.print_exc()
