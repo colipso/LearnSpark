@@ -16,6 +16,7 @@ from pyspark.sql import functions as F
 from pyspark.ml.evaluation import RegressionEvaluator
 from pyspark.mllib.linalg import DenseVector
 from pyspark.ml.linalg import Vectors
+from pyspark.ml.regression import LinearRegression
 
 sc = SparkContext("local[4]","cs120 week2")
 sc.setLogLevel("ERROR")
@@ -127,6 +128,7 @@ try:
     
     def changeMLB2ml(df):
         return sqc.createDataFrame(df.rdd.map(lambda x : (x.label , Vectors.dense(x.features.values))),['label','features'])
+    '''
     #train model
     weights_LR , error_lit = linreg_gradient_descent(parsed_train_data_df.rdd,30)
     
@@ -142,7 +144,7 @@ try:
     intercept_LR = first_model.intercept
     outPutPrint("The linear regression coefficient are ",coefficients)
     outPutPrint("The linear regression intercept is ", intercept_LR)
-    
+    '''
     #use pipeline
     from pyspark.ml import Pipeline
     from pyspark.ml.feature import PolynomialExpansion
