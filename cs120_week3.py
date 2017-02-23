@@ -19,6 +19,9 @@ from pyspark.ml.classification import LogisticRegression
 from pyspark.sql.functions import when, log, col
 from pyspark.sql.functions import lit
 from math import exp
+from collections import defaultdict
+import hashlib
+
 
 epsilon = 1e-16
 
@@ -216,6 +219,7 @@ try:
     
     ctr_ohe_dict = create_one_hot_dict(parsed_raw_df.select(parsed_raw_df.feature.alias('features')))
     #Log('ctr ohe dict are :' , ctr_ohe_dict)
+    
     ohe_dict_broadcast = sc.broadcast(ctr_ohe_dict)
     ohe_dict_udf = ohe_udf_generator(ohe_dict_broadcast)
     ohe_train_df = parsed_train_df.select(parsed_train_df.label.alias('label'),ohe_dict_udf(parsed_train_df.feature).alias('feature'))
@@ -263,7 +267,7 @@ try:
     log_loss_tr_base = add_log_loss(ohe_train_df.select(ohe_train_df.label.alias('label') , lit(class_one_frac_train).alias('p')))
     
     baseLogLossSum = log_loss_tr_base.select(mean(log_loss_tr_base.log_loss)).collect()[0][0]
-    Log("Base line model sum of log loss is " , baseLogLossSum)
+    Log("Base line model avg of log loss is " , baseLogLossSum)
     Log("Base line model p is ",class_one_frac_train)
     
     
@@ -326,6 +330,139 @@ try:
     testDataLogLoss = evaluate_results(ohe_test_df , lr_model_basic)
     Log("testDataLogLoss is " ,testDataLogLoss)
     
+    #draw ROC curve
+    import matplotlib.pyplot as plt
+    def prepare_plot(xticks, yticks, figsize=(10.5, 6), hide_labels=False, grid_color='#999999',
+                 grid_width=1.0):
+        """Template for generating the plot layout."""
+        plt.close()
+        fig, ax = plt.subplots(figsize=figsize, facecolor='white', edgecolor='white')
+        ax.axes.tick_params(labelcolor='#999999', labelsize='10')
+        for axis, ticks in [(ax.get_xaxis(), xticks), (ax.get_yaxis(), yticks)]:
+            axis.set_ticks_position('none')
+            axis.set_ticks(ticks)
+            axis.label.set_color('#999999')
+            if hide_labels: axis.set_ticklabels([])
+        plt.grid(color=grid_color, linewidth=grid_width, linestyle='-')
+        map(lambda position: ax.spines[position].set_visible(False), ['bottom', 'top', 'left', 'right'])
+        return fig, ax
+    
+    labels_and_scores = add_probability_model_basic(ohe_validation_df).select('label', 'p')
+    labels_and_weights = labels_and_scores.collect()
+    labels_and_weights.sort(key=lambda (k, v): v, reverse=True)
+    #every point of ROC curve depand on the threshold of p which is sorted by Labels_and_weights
+    #points larger than p are all labeled by postive which calc TP and FP ,than calc TPR and FPR 
+    labels_by_weight = np.array([k for (k, v) in labels_and_weights])
+    
+    length = labels_by_weight.size
+    true_positives = labels_by_weight.cumsum()
+    num_positive = true_positives[-1]
+    false_positives = np.arange(1.0, length + 1, 1.) - true_positives
+    
+    true_positive_rate = true_positives / num_positive
+    false_positive_rate = false_positives / (length - num_positive)
+    
+    # Generate layout and plot data
+    fig, ax = prepare_plot(np.arange(0., 1.1, 0.1), np.arange(0., 1.1, 0.1))
+    ax.set_xlim(-.05, 1.05), ax.set_ylim(-.05, 1.05)
+    ax.set_ylabel('True Positive Rate (Sensitivity)')
+    ax.set_xlabel('False Positive Rate (1 - Specificity)')
+    plt.plot(false_positive_rate, true_positive_rate, color='#8cbfd0', linestyle='-', linewidth=3.)
+    plt.plot((0., 1.), (0., 1.), linestyle='--', color='#d6ebf2', linewidth=2.)  # Baseline model
+    plt.show()
+    #reduce feature dimension
+    Log('The dimension of base model which without hash  is ',len(ctr_ohe_dict))
+    Log('The dimension of hash model is ' , 2**15)
+    def hash_function(raw_feats, num_buckets, print_mapping=False):
+        """Calculate a feature dictionary for an observation's features based on hashing.
+    
+        Note:
+            Use print_mapping=True for debug purposes and to better understand how the hashing works.
+    
+        Args:
+            raw_feats (list of (int, str)): A list of features for an observation.  Represented as
+                (featureID, value) tuples.
+            num_buckets (int): Number of buckets to use as features.
+            print_mapping (bool, optional): If true, the mappings of featureString to index will be
+                printed.
+    
+        Returns:
+            dict of int to float:  The keys will be integers which represent the buckets that the
+                features have been hashed to.  The value for a given key will contain the count of the
+                (featureID, value) tuples that have hashed to that key.
+        """
+        mapping = { category + ':' + str(ind) : int(int(hashlib.md5(category + ':' + str(ind)).hexdigest(), 16) % num_buckets) for ind , category in raw_feats}
+        if print_mapping:
+            print mapping
+        def map_update(l,r):
+            l[r] += 1.0
+            return l
+        sparse_features = reduce(map_update , mapping.values() , defaultdict(float))
+        return dict(sparse_features)
+    
+    num_hash_buckets = 2**15
+    tuples_to_hash_features_udf = udf(lambda x : Vectors.sparse(num_hash_buckets ,hash_function(x , num_hash_buckets) ), VectorUDT())
+    def add_hash_features(df):
+        return df.select(df.label.alias('label'),tuples_to_hash_features_udf(df.feature).alias('feature'))
+    hash_train_df = add_hash_features(parsed_train_df)
+    hash_validation_df = add_hash_features(parsed_validation_df)
+    hash_test_df = add_hash_features(parsed_test_df)
+    hash_train_df.cache()
+    hash_validation_df.cache()
+    hash_test_df.cache()
+    
+    Log("Compare hash_train_df and ohe_train_df")
+    hash_train_df.show()
+    ohe_train_df.show()
+    
+    def vector_feature_sparsity(sparse_vector):
+        """Calculates the sparsity of a SparseVector.
+    
+        Args:
+            sparse_vector (SparseVector): The vector containing the features.
+    
+        Returns:
+            float: The ratio of features found in the vector to the total number of features.
+        """
+        return len(sparse_vector.indices)*1.0 / len(sparse_vector)
+    feature_sparsity_udf = udf(vector_feature_sparsity, DoubleType())
+    
+    def get_sparsity(df):
+        """Calculates the average sparsity for the features in a DataFrame.
+    
+        Args:
+            df (DataFrame with 'features' column): A DataFrame with sparse features.
+    
+        Returns:
+            float: The average feature sparsity.
+        """
+        return df.select(feature_sparsity_udf(df.feature).alias('sparsity')).select(mean('sparsity')).collect()[0][0]
+    
+    average_sparsity_ohe = get_sparsity(ohe_train_df)
+    average_sparsity_hash = get_sparsity(hash_train_df) 
+    Log("average sparsity ohe : " ,average_sparsity_ohe)
+    Log("average sparsity hash :" , average_sparsity_hash)
+    
+    lr_hash = LogisticRegression(featuresCol="feature",
+                            labelCol="label" ,
+                            maxIter=20 ,
+                            standardization=False ,
+                            regParam=0.01, 
+                            elasticNetParam=0.7)
+    lr_model_hashed = lr_hash.fit(hash_train_df)
+    log_loss_train_model_hashed = evaluate_results(hash_train_df , lr_model_hashed)
+    Log("intercept of hashed model are " , lr_model_hashed.intercept)
+    Log("The log loss of hashed model is " , log_loss_train_model_hashed)
+    Log("The log loss of ohe model is " , trainDataLogLoss)
+    
+    log_loss_test = evaluate_results(hash_test_df , lr_model_hashed)
+    Log("The log loss of test hash df is " , log_loss_test)
+    Log("The log loss of test ohe df is " , testDataLogLoss)
+    
+    class_one_frac_test = hash_test_df.select(mean(hash_test_df.label)).collect()[0][0]
+    log_loss_test_base = add_log_loss(hash_test_df.select(hash_test_df.label.alias('label') , lit(class_one_frac_train).alias('p')))
+    baseLogLosstest = log_loss_test_base.select(mean(log_loss_test_base.log_loss)).collect()[0][0]
+    Log("Base line model avg of log loss is " , baseLogLosstest)
     
     
 except Exception as e:
